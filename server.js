@@ -1,60 +1,62 @@
 // server.js
-// Authoritative WebSocket server for Tag Echobound with party/lobby/match support
-// and controller broadcast support (update/shutdown/maintenance).
-//
-// Requirements: npm install ws uuid
-// Start: node server.js
-//
-// Make sure to set CONTROLLER_SECRET in your environment for controller auth.
+// Tag Echobound authoritative WebSocket server with controller broadcast support.
+// Dependencies: ws, uuid
+// Install: npm install ws uuid
+// Start: CONTROLLER_SECRET=<secret> node server.js
+'use strict';
 
 const http = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 
 const PORT = process.env.PORT || 8080;
-const TICK_RATE = 20; // server ticks per second
-const SNAPSHOT_RATE = 10; // snapshots per second
+const TICK_RATE = 20;        // server ticks per second
+const SNAPSHOT_RATE = 10;    // snapshots per second
 const CONTROLLER_SECRET = process.env.CONTROLLER_SECRET || 'dev-secret-please-change';
 
 // In-memory stores
-const sockets = new Map(); // wsId -> { ws, playerId, name }
-const parties = new Map(); // partyId -> { id, hostId, members: [{id,name,wsId,ready}], maxPlayers, state }
-const matches = new Map(); // matchId -> { id, partyId, state, running, loop }
+const sockets = new Map();   // wsId -> { ws, playerId, name }
+const parties = new Map();   // partyId -> { id, hostId, members: [{id,name,wsId,ready}], maxPlayers, state }
+const matches = new Map();   // matchId -> { id, partyId, state, running, loop }
 
 // Utilities
-function send(ws, obj){
-  try{ ws.send(JSON.stringify(obj)); } catch(e){ /* ignore send errors */ }
+function safeSend(ws, obj){
+  try { ws.send(JSON.stringify(obj)); } catch(e) { /* ignore send errors */ }
 }
+
 function broadcastAll(obj){
   for(const [wsId, s] of sockets.entries()){
-    try{ if(s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify(obj)); } catch(e){ /* ignore */ }
+    try {
+      if(s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify(obj));
+    } catch(e){}
   }
 }
+
 function broadcastParty(partyId, obj){
   const party = parties.get(partyId);
   if(!party) return;
   for(const m of party.members){
     const s = sockets.get(m.wsId);
-    if(s && s.ws && s.ws.readyState === WebSocket.OPEN) {
-      try{ s.ws.send(JSON.stringify(obj)); } catch(e){}
+    if(s && s.ws && s.ws.readyState === WebSocket.OPEN){
+      try { s.ws.send(JSON.stringify(obj)); } catch(e){}
     }
   }
 }
 
-// Basic game state skeleton (simple authoritative match state)
+// Basic match state factory
 function createEmptyMatchState(party){
-  const players = party.members.map((m, idx)=>({
+  const players = party.members.map((m, idx) => ({
     id: m.id,
     name: m.name,
     slot: idx,
-    x: 100 + idx*80,
-    y: 100,
-    vx:0, vy:0, size:56, dead:false, downed:false
+    x: 200 + idx * 80,
+    y: 200,
+    vx: 0, vy: 0, size: 56, dead: false, downed: false
   }));
-  return { tick:0, players, tagger:0, pickups:[], rebootCards:[], time:0 };
+  return { tick: 0, players, tagger: 0, pickups: [], rebootCards: [], time: 0 };
 }
 
-// HTTP server (not serving pages, only used to attach ws)
+// HTTP server (used only to attach WebSocket)
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
@@ -65,7 +67,7 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (raw) => {
     let msg;
-    try{ msg = JSON.parse(raw); } catch(e){ console.warn('[ws] invalid json', e); return; }
+    try { msg = JSON.parse(raw); } catch(e) { console.warn('[ws] invalid json', e); return; }
     handleMessage(wsId, msg);
   });
 
@@ -75,11 +77,11 @@ wss.on('connection', (ws) => {
     const s = sockets.get(wsId);
     if(s && s.playerId){
       for(const [pid, party] of parties.entries()){
-        const idx = party.members.findIndex(m=>m.wsId === wsId);
+        const idx = party.members.findIndex(m => m.wsId === wsId);
         if(idx !== -1){
           const removed = party.members.splice(idx,1)[0];
           console.log(`[party] removed ${removed.name} from ${pid}`);
-          broadcastParty(pid, { type:'party_update', partyId:pid, members: party.members.map(m=>({id:m.id,name:m.name,ready:m.ready})), hostId: party.hostId });
+          broadcastParty(pid, { type:'party_update', partyId: pid, members: party.members.map(m=>({id:m.id,name:m.name,ready:m.ready})), hostId: party.hostId });
           if(party.hostId === removed.id && party.members.length) party.hostId = party.members[0].id;
           if(party.members.length === 0) parties.delete(pid);
         }
@@ -96,33 +98,32 @@ wss.on('connection', (ws) => {
 function handleMessage(wsId, msg){
   const s = sockets.get(wsId);
   if(!s) return;
-  // Basic logging for debugging
   console.log(`[msg] from ${wsId}:`, msg.type);
 
   switch(msg.type){
     case 'auth': {
       const playerId = msg.playerId || uuidv4();
       s.playerId = playerId;
-      s.name = msg.name || ('Player-'+playerId.slice(0,4));
-      send(s.ws, { type:'auth_ok', playerId, name:s.name });
-      console.log(`[auth] ${wsId} as ${s.name} (${playerId})`);
+      s.name = msg.name || ('Player-'+playerId.slice(0,6));
+      safeSend(s.ws, { type:'auth_ok', playerId, name: s.name });
+      console.log(`[auth] ws=${wsId} as ${s.name} (${playerId})`);
       break;
     }
 
     case 'create_party': {
-      if(!s.playerId) return send(s.ws, { type:'party_error', message:'not authenticated' });
+      if(!s.playerId) return safeSend(s.ws, { type:'party_error', message:'not authenticated' });
       const partyId = uuidv4().slice(0,6);
-      const party = { id:partyId, hostId: s.playerId, members: [{ id: s.playerId, name: s.name, wsId, ready:false }], maxPlayers: msg.maxPlayers || 4, state:'lobby' };
+      const party = { id: partyId, hostId: s.playerId, members: [{ id: s.playerId, name: s.name, wsId, ready:false }], maxPlayers: msg.maxPlayers || 8, state: 'lobby' };
       parties.set(partyId, party);
-      send(s.ws, { type:'party_created', partyId, hostId: party.hostId, members: party.members });
+      safeSend(s.ws, { type:'party_created', partyId, hostId: party.hostId, members: party.members });
       console.log(`[party] created ${partyId} by ${s.name}`);
       break;
     }
 
     case 'join_party': {
       const party = parties.get(msg.partyId);
-      if(!party) return send(s.ws, { type:'party_error', message:'party not found' });
-      if(party.members.length >= party.maxPlayers) return send(s.ws, { type:'party_error', message:'party full' });
+      if(!party) return safeSend(s.ws, { type:'party_error', message:'party not found' });
+      if(party.members.length >= party.maxPlayers) return safeSend(s.ws, { type:'party_error', message:'party full' });
       const member = { id: s.playerId || uuidv4(), name: msg.name || s.name, wsId, ready:false };
       party.members.push(member);
       broadcastParty(party.id, { type:'party_update', partyId: party.id, members: party.members.map(m=>({id:m.id,name:m.name,ready:m.ready})), hostId: party.hostId });
@@ -132,10 +133,10 @@ function handleMessage(wsId, msg){
 
     case 'leave_party': {
       for(const [pid, party] of parties.entries()){
-        const idx = party.members.findIndex(m=>m.wsId === wsId);
+        const idx = party.members.findIndex(m => m.wsId === wsId);
         if(idx !== -1){
           const removed = party.members.splice(idx,1)[0];
-          broadcastParty(party.id, { type:'party_update', partyId:party.id, members: party.members.map(m=>({id:m.id,name:m.name,ready:m.ready})), hostId: party.hostId });
+          broadcastParty(party.id, { type:'party_update', partyId: party.id, members: party.members.map(m=>({id:m.id,name:m.name,ready:m.ready})), hostId: party.hostId });
           if(party.hostId === removed.id && party.members.length) party.hostId = party.members[0].id;
           if(party.members.length === 0) parties.delete(pid);
           console.log(`[party] ${removed.name} left ${pid}`);
@@ -146,20 +147,20 @@ function handleMessage(wsId, msg){
 
     case 'ready': {
       for(const party of parties.values()){
-        const m = party.members.find(x=>x.wsId === wsId);
-        if(m){ m.ready = !!msg.ready; broadcastParty(party.id, { type:'party_update', partyId:party.id, members: party.members.map(mm=>({id:mm.id,name:mm.name,ready:mm.ready})), hostId: party.hostId }); break; }
+        const m = party.members.find(x => x.wsId === wsId);
+        if(m){ m.ready = !!msg.ready; broadcastParty(party.id, { type:'party_update', partyId: party.id, members: party.members.map(mm=>({id:mm.id,name:mm.name,ready:mm.ready})), hostId: party.hostId }); break; }
       }
       break;
     }
 
     case 'start_party': {
       const party = parties.get(msg.partyId);
-      if(!party) return send(s.ws, { type:'party_error', message:'party not found' });
-      if(party.hostId !== s.playerId) return send(s.ws, { type:'party_error', message:'only host can start' });
+      if(!party) return safeSend(s.ws, { type:'party_error', message:'party not found' });
+      if(party.hostId !== s.playerId) return safeSend(s.ws, { type:'party_error', message:'only host can start' });
       const matchId = uuidv4();
       const matchState = createEmptyMatchState(party);
-      matches.set(matchId, { id:matchId, partyId: party.id, state: matchState, running:true });
-      broadcastParty(party.id, { type:'match_starting', matchId, countdown:3 });
+      matches.set(matchId, { id: matchId, partyId: party.id, state: matchState, running: true });
+      broadcastParty(party.id, { type:'match_starting', matchId, countdown: 3 });
       console.log(`[match] starting ${matchId} for party ${party.id}`);
       setTimeout(()=> startMatchLoop(matchId), 3000);
       break;
@@ -168,7 +169,7 @@ function handleMessage(wsId, msg){
     case 'input': {
       // route input to match state (simple)
       for(const match of matches.values()){
-        const player = match.state.players.find(p=> p.id === s.playerId);
+        const player = match.state.players.find(p => p.id === s.playerId);
         if(player){
           player.lastInput = msg;
         }
@@ -178,9 +179,11 @@ function handleMessage(wsId, msg){
 
     case 'controller': {
       // msg: { type:'controller', secret:'...', target:'all'|'party', partyId?:string, action:'update'|'shutdown'|'maintenance' }
-      const secret = msg.secret || '';
+      const secret = (msg.secret || '').trim();
+      // debug log (masked)
+      console.log(`[controller-debug] from ws=${wsId} name=${s.name||'-'} secretPrefix=${secret.slice(0,6)} action=${msg.action}`);
       if(secret !== CONTROLLER_SECRET){
-        if(s.ws && s.ws.readyState === WebSocket.OPEN) send(s.ws, { type:'controller_error', message:'unauthorized' });
+        if(s.ws && s.ws.readyState === WebSocket.OPEN) safeSend(s.ws, { type:'controller_error', message:'unauthorized' });
         console.warn(`[controller] unauthorized attempt from ws ${wsId}`);
         break;
       }
@@ -193,17 +196,16 @@ function handleMessage(wsId, msg){
         broadcastAll(payload);
         console.log(`[controller] action=${action} -> all`);
       }
-      // audit log to console
       console.log(`[controller-audit] by ${s.name || wsId} action=${action} target=${msg.target || 'all'} party=${msg.partyId || '-'}`);
       break;
     }
 
     default:
-      send(s.ws, { type:'error', message:'unknown message' });
+      safeSend(s.ws, { type:'error', message:'unknown message' });
   }
 }
 
-// Match loop: simple authoritative tick and snapshot broadcast
+// Match loop: authoritative tick and snapshot broadcast
 function startMatchLoop(matchId){
   const match = matches.get(matchId);
   if(!match) return;
@@ -211,7 +213,7 @@ function startMatchLoop(matchId){
   const snapshotInterval = Math.max(1, Math.round(TICK_RATE / SNAPSHOT_RATE));
   let tickCount = 0;
 
-  match.loop = setInterval(()=>{
+  match.loop = setInterval(() => {
     tickCount++;
     // apply inputs and integrate
     for(const p of match.state.players){
@@ -221,9 +223,8 @@ function startMatchLoop(matchId){
         if(inp.keys.left) p.vx -= speed * (1/TICK_RATE);
         if(inp.keys.right) p.vx += speed * (1/TICK_RATE);
         if(inp.keys.jump && Math.abs(p.vy) < 0.1) p.vy = -600;
-        // attack handling could be added here
       }
-      // integrate
+      // integrate simple physics
       p.vy += 1200 * (1/TICK_RATE);
       p.x += p.vx * (1/TICK_RATE);
       p.y += p.vy * (1/TICK_RATE);
@@ -235,16 +236,14 @@ function startMatchLoop(matchId){
     // broadcast snapshots at snapshot rate
     if(tickCount % snapshotInterval === 0){
       const party = parties.get(match.partyId);
-      if(party) broadcastParty(party.id, { type:'snapshot', tick: match.state.tick, state: { players: match.state.players.map(pl=>({id:pl.id,x:pl.x,y:pl.y,vx:pl.vx,vy:pl.vy,dead:pl.dead,downed:pl.downed})), tagger: match.state.tagger } });
+      if(party) broadcastParty(party.id, { type:'snapshot', tick: match.state.tick, state: { players: match.state.players.map(pl => ({ id: pl.id, x: pl.x, y: pl.y, vx: pl.vx, vy: pl.vy, dead: pl.dead, downed: pl.downed })), tagger: match.state.tagger } });
     }
   }, tickInterval);
 
-  // store loop id so we can clear it later
   match.running = true;
   console.log(`[match] loop started ${matchId}`);
 }
 
-// Graceful shutdown helper for matches (not used now but useful)
 function stopMatchLoop(matchId){
   const match = matches.get(matchId);
   if(!match) return;
@@ -254,5 +253,5 @@ function stopMatchLoop(matchId){
   console.log(`[match] stopped ${matchId}`);
 }
 
-// Start HTTP + WS server
-server.listen(PORT, ()=> console.log('Server listening on', PORT));
+// Start server
+server.listen(PORT, () => console.log('Server listening on', PORT));
